@@ -2,8 +2,8 @@ package main
 
 import (
 	"fmt"
-	"os"
-	"os/signal"
+	"log"
+	"strconv"
 
 	"github.com/bootdotdev/learn-pub-sub-starter/internal/gamelogic"
 	"github.com/bootdotdev/learn-pub-sub-starter/internal/pubsub"
@@ -12,77 +12,112 @@ import (
 )
 
 func main() {
+	fmt.Println("Starting Peril client...")
+	const rabbitConnString = "amqp://guest:guest@localhost:5672/"
 
-	connectionString := "amqp://guest:guest@localhost:5672/"
-
-	conn, err := amqp.Dial(connectionString)
+	conn, err := amqp.Dial(rabbitConnString)
 	if err != nil {
-		fmt.Println("Error connecting to RabbitMQ:", err)
-		return
+		log.Fatalf("could not connect to RabbitMQ: %v", err)
 	}
 	defer conn.Close()
+	fmt.Println("Peril game client connected to RabbitMQ!")
 
-	fmt.Println("Successfully connected to RabbitMQ")
-
-	name, err := gamelogic.ClientWelcome()
+	publishCh, err := conn.Channel()
 	if err != nil {
-		fmt.Println("Error occurred:", err)
-		return
+		log.Fatalf("could not create channel: %v", err)
 	}
 
-	state := gamelogic.NewGameState(name)
-	pubsub.SubscribeJSON(conn, routing.ExchangePerilDirect, routing.PauseKey+"."+name, routing.PauseKey, pubsub.Transient, handlerPause(state))
-
-	pubsub.SubscribeJSON(conn, routing.ExchangePerilTopic, routing.ArmyMovesPrefix+"."+name, routing.ArmyMovesPrefix+".*", pubsub.Transient, handlerMove(state))
-
-	ch, err := conn.Channel()
+	username, err := gamelogic.ClientWelcome()
 	if err != nil {
-		fmt.Println("Error creating channel:", err)
-		return
+		log.Fatalf("could not get username: %v", err)
 	}
-	defer ch.Close()
+	gs := gamelogic.NewGameState(username)
+
+	err = pubsub.SubscribeJSON(
+		conn,
+		routing.ExchangePerilTopic,
+		routing.ArmyMovesPrefix+"."+gs.GetUsername(),
+		routing.ArmyMovesPrefix+".*",
+		pubsub.SimpleQueueTransient,
+		handlerMove(gs, publishCh),
+	)
+	if err != nil {
+		log.Fatalf("could not subscribe to army moves: %v", err)
+	}
+	err = pubsub.SubscribeJSON(
+		conn,
+		routing.ExchangePerilDirect,
+		routing.PauseKey+"."+gs.GetUsername(),
+		routing.PauseKey,
+		pubsub.SimpleQueueTransient,
+		handlerPause(gs),
+	)
+
+	err = pubsub.SubscribeJSON(
+		conn,
+		routing.ExchangePerilTopic,
+		"war",
+		routing.WarRecognitionsPrefix+"."+"*",
+		pubsub.SimpleQueueDurable,
+		handlerAllWar(gs, publishCh))
+
+	if err != nil {
+		log.Fatalf("could not subscribe to pause: %v", err)
+	}
+
 	for {
-		input := gamelogic.GetInput()
-		switch input[0] {
-		case "spawn":
-			state.CommandSpawn(input)
+		words := gamelogic.GetInput()
+		if len(words) == 0 {
+			continue
+		}
+		switch words[0] {
 		case "move":
-			mv, err := state.CommandMove(input)
+			mv, err := gs.CommandMove(words)
 			if err != nil {
-				fmt.Println("Error:", err)
+				fmt.Println(err)
 				continue
 			}
-			err = pubsub.PublishJSON(ch, routing.ExchangePerilTopic, routing.ArmyMovesPrefix+"."+name, mv)
+
+			err = pubsub.PublishJSON(
+				publishCh,
+				routing.ExchangePerilTopic,
+				routing.ArmyMovesPrefix+"."+mv.Player.Username,
+				mv,
+			)
+			if err != nil {
+				fmt.Printf("error: %s\n", err)
+				continue
+			}
+			fmt.Printf("Moved %v units to %s\n", len(mv.Units), mv.ToLocation)
+		case "spawn":
+			err = gs.CommandSpawn(words)
+			if err != nil {
+				fmt.Println(err)
+				continue
+			}
 		case "status":
-			state.CommandStatus()
+			gs.CommandStatus()
 		case "help":
 			gamelogic.PrintClientHelp()
 		case "spam":
-			fmt.Println("pamming not allowed yet!")
+			if len(words) < 2 {
+				fmt.Println("Usage: spam <number>")
+				continue
+			}
+			num, err := strconv.Atoi(words[1])
+			if err != nil {
+				fmt.Println("Usage: spam <number>")
+				continue
+			}
+			for i := 0; i < num; i++ {
+				log := gamelogic.GetMaliciousLog()
+				publishGameLog(publishCh, routing.GameLog{Message: log, Username: gs.GetUsername()})
+			}
 		case "quit":
 			gamelogic.PrintQuit()
 			return
 		default:
-			fmt.Println("Unknown command. Type 'help' for a list of commands.")
+			fmt.Println("unknown command")
 		}
-	}
-	// wait for ctrl+c
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, os.Interrupt)
-	<-signalChan
-	fmt.Println("RabbitMQ connection closed.")
-}
-
-func handlerPause(gs *gamelogic.GameState) func(routing.PlayingState) {
-	return func(ps routing.PlayingState) {
-		defer fmt.Println("> ")
-		gs.HandlePause(ps)
-	}
-}
-
-func handlerMove(gs *gamelogic.GameState) func(gamelogic.ArmyMove) {
-	return func(move gamelogic.ArmyMove) {
-		defer fmt.Println("> ")
-		gs.HandleMove(move)
 	}
 }
